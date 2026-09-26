@@ -116,7 +116,7 @@ class OdooConnector extends Connector
                 'instructions' => Craft::t('erpy', 'The numeric id of the stock location stock is read from. Leave blank for all internal locations.'),
             ]),
             Field::text('pricelistId', Craft::t('erpy', 'Base pricelist ID'), [
-                'instructions' => Craft::t('erpy', 'Items on this pricelist become the Commerce base price. Other pricelists become contract pricing.'),
+                'instructions' => Craft::t('erpy', 'Usually your public pricelist. Its items are left out of contract pricing — the Commerce base price comes from each product’s Sales Price. Every other pricelist becomes contract pricing.'),
             ]),
             Field::text('salesTeamId', Craft::t('erpy', 'Sales team ID'), [
                 'instructions' => Craft::t('erpy', 'Optional. Web orders are often given their own team so they can be reported on separately.'),
@@ -240,20 +240,41 @@ class OdooConnector extends Connector
     protected function fetchPrices(FetchCriteria $criteria): Page
     {
         $basePricelist = (string)$this->setting('pricelistId', '');
-        $domain = [['product_id', '!=', false]];
+
+        // Odoo pricelist items express themselves three ways: a fixed price, a percentage off, or
+        // a formula. Only two can be honoured without re-implementing Odoo's pricing engine:
+        //
+        // - `fixed` carries its own price.
+        // - `percentage` is honoured only when it is a percentage off the product's Sales Price
+        //   (`base = list_price`), because that is the price the product sync writes to Commerce
+        //   and the one Erpy discounts at cart time. A percentage off cost or off another
+        //   pricelist has no Commerce equivalent.
+        //
+        // Everything else — every `formula` rule, and a percentage on any other base — is left
+        // out in the domain rather than skipped per row. Skipping per row would emit a price of
+        // 0 (Odoo's `fixed_price` on a non-fixed rule) that becomes a zero contract price at
+        // checkout, and filtering in PHP could leave a whole page empty, which ends the run.
+        $domain = [
+            ['product_id', '!=', false],
+            '|',
+            ['compute_price', '=', 'fixed'],
+            '&',
+            ['compute_price', '=', 'percentage'],
+            ['base', '=', 'list_price'],
+        ];
 
         if ($basePricelist !== '') {
+            // The public pricelist's prices already reach Commerce as each product's Sales
+            // Price, so its items are not contract pricing.
             $domain[] = ['pricelist_id', '!=', (int)$basePricelist];
         }
 
         return $this->searchPage('product.pricelist.item', [
-            'id', 'product_id', 'pricelist_id', 'min_quantity', 'fixed_price',
+            'id', 'product_id', 'pricelist_id', 'min_quantity', 'fixed_price', 'base',
             'percent_price', 'compute_price', 'date_start', 'date_end', 'currency_id', 'write_date',
         ], $domain, $criteria, Entity::PRICE, function(array $row): ErpPrice {
-            // Odoo pricelist items express themselves three ways: a fixed price, a percentage
-            // off, or a formula. Only the first two can be honoured without re-implementing
-            // Odoo's pricing engine, and a formula rule is passed through as a percentage of nil
-            // so it is visibly wrong rather than quietly wrong.
+            // A percentage row carries a unit price of 0 and a discount; Erpy reads that pair as
+            // "this much off the catalogue price", never as a price of 0.
             $isPercentage = (string)($row['compute_price'] ?? '') === 'percentage';
 
             return new ErpPrice([
@@ -293,9 +314,7 @@ class OdooConnector extends Connector
             ]);
 
             return new ErpCustomer([
-                // `ref` is Odoo's customer reference. Falling back to the id keeps a partner that
-                // has never been given one addressable rather than skipping it.
-                'code' => (string)($row['ref'] ?: $row['id'] ?? ''),
+                'code' => $this->partnerCode($row),
                 'name' => (string)($row['name'] ?? ''),
                 'email' => $row['email'] ?: null,
                 'phone' => $row['phone'] ?: null,
@@ -308,7 +327,7 @@ class OdooConnector extends Connector
                 'balance' => isset($row['credit']) ? (float)$row['credit'] : null,
                 'addresses' => $address->isEmpty() ? [] : [$address],
                 'remoteId' => (string)($row['id'] ?? ''),
-                'remoteKey' => (string)($row['ref'] ?: ''),
+                'remoteKey' => $this->partnerRef($row) ?? '',
                 'modifiedAt' => $this->date($row['write_date'] ?? null),
                 'raw' => $row,
             ]);
@@ -321,7 +340,7 @@ class OdooConnector extends Connector
             'id', 'ref', 'credit_limit', 'credit', 'currency_id', 'property_payment_term_id',
         ], [['customer_rank', '>', 0]], $criteria, Entity::CREDIT, function(array $row): ErpCredit {
             return new ErpCredit([
-                'customerCode' => (string)($row['ref'] ?: $row['id'] ?? ''),
+                'customerCode' => $this->partnerCode($row),
                 'currency' => (string)($this->relationName($row['currency_id'] ?? null) ?: 'USD'),
                 // Odoo stores 0 for "no limit", which is not at all the same as a limit of zero.
                 'creditLimit' => ((float)($row['credit_limit'] ?? 0)) > 0 ? (float)$row['credit_limit'] : null,
@@ -329,7 +348,9 @@ class OdooConnector extends Connector
                 'paymentTermsCode' => (string)$this->relationId($row['property_payment_term_id'] ?? null) ?: null,
                 'raw' => $row,
             ]);
-        });
+            // No delta: `credit` is computed from journal items, so a partner's balance moves
+            // without its `write_date` ever changing. A watermark here would miss every payment.
+        }, delta: false);
     }
 
     protected function fetchOrderStatuses(FetchCriteria $criteria): Page
@@ -395,7 +416,9 @@ class OdooConnector extends Connector
             return new ErpInvoice([
                 'invoiceNumber' => (string)($row['name'] ?? ''),
                 'orderNumber' => (string)($row['invoice_origin'] ?? ''),
-                'customerCode' => (string)$this->relationId($row['partner_id'] ?? null),
+                // The partner's reference, not its id, so an invoice lands on the same account
+                // the customer sync created.
+                'customerCode' => $this->partnerCodeFor($row['partner_id'] ?? null),
                 'issuedAt' => $this->date($row['invoice_date'] ?? null),
                 'dueAt' => $this->date($row['invoice_date_due'] ?? null),
                 'currency' => (string)($this->relationName($row['currency_id'] ?? null) ?: 'USD'),
@@ -411,7 +434,10 @@ class OdooConnector extends Connector
                 'modifiedAt' => $this->date($row['write_date'] ?? null),
                 'raw' => $row,
             ]);
-        });
+        }, fn(array $rows) => $this->primePartnerCodes(array_map(
+            fn($row) => is_array($row) ? $this->relationId($row['partner_id'] ?? null) : null,
+            $rows,
+        )));
     }
 
     // ---------------------------------------------------------------------------------------
@@ -445,11 +471,17 @@ class OdooConnector extends Connector
         }
 
         // `client_order_ref` carries the Commerce order number, so a retried job can ask before
-        // it creates rather than leaving two quotations behind.
-        $existing = $this->searchRead('sale.order', [['client_order_ref', '=', $document->orderNumber]], ['id', 'name'], 1);
+        // it creates rather than leaving two quotations behind. Each row is compared as well as
+        // searched for: a domain a custom module or a proxy mis-applies must not make every
+        // order after the first look delivered.
+        if ($remoteId === null) {
+            $existing = $this->searchRead('sale.order', [['client_order_ref', '=', $document->orderNumber]], ['id', 'name', 'client_order_ref'], 20);
 
-        if ($existing !== [] && $remoteId === null) {
-            return PushResult::alreadyExists((string)$existing[0]['id'], (string)($existing[0]['name'] ?? ''));
+            foreach ($existing as $row) {
+                if (is_array($row) && (string)($row['client_order_ref'] ?? '') === $document->orderNumber) {
+                    return PushResult::alreadyExists((string)($row['id'] ?? ''), (string)($row['name'] ?? ''));
+                }
+            }
         }
 
         $lines = [];
@@ -518,15 +550,48 @@ class OdooConnector extends Connector
         }
 
         if ($document->customerCode) {
-            $found = $this->searchRead('res.partner', [['ref', '=', $document->customerCode]], ['id'], 1);
+            $found = $this->findPartnerByCode($document->customerCode);
+
+            if ($found !== null) {
+                return $found;
+            }
+        }
+
+        if ($document->email) {
+            $found = $this->searchRead('res.partner', [['email', '=', $document->email]], ['id'], 1);
 
             if ($found !== []) {
                 return (int)$found[0]['id'];
             }
         }
 
-        if ($document->email) {
-            $found = $this->searchRead('res.partner', [['email', '=', $document->email]], ['id'], 1);
+        return null;
+    }
+
+    /**
+     * The partner a customer code names — the inverse of {@see partnerCode()}.
+     *
+     * A code is a partner's `ref`, or its id when it has none, so the lookup asks the same two
+     * questions in the same order. The id fallback only matches a partner with no reference:
+     * one that has a reference is not called by its id anywhere else, and "42" naming partner 42
+     * when partner 42 is known everywhere as "ACME" would put the order on the wrong account.
+     */
+    private function findPartnerByCode(string $code): ?int
+    {
+        $code = trim($code);
+
+        if ($code === '') {
+            return null;
+        }
+
+        $found = $this->searchRead('res.partner', [['ref', '=', $code]], ['id'], 1);
+
+        if ($found !== []) {
+            return (int)$found[0]['id'];
+        }
+
+        if (ctype_digit($code)) {
+            $found = $this->searchRead('res.partner', [['id', '=', (int)$code], ['ref', '=', false]], ['id'], 1);
 
             if ($found !== []) {
                 return (int)$found[0]['id'];
@@ -573,12 +638,18 @@ class OdooConnector extends Connector
      *  from "the ERP was not there". Odoo's own errors all arrive as 200. */
     private int $lastStatus = 0;
 
-    private function searchPage(string $model, array $fields, array $domain, FetchCriteria $criteria, string $entity, callable $make): Page
+    /**
+     * @param callable|null $prime called with the page's raw rows before any is mapped, so a
+     *     lookup the mapper needs can be made once per page rather than once per row
+     * @param bool $delta false for an entity whose capabilities declare no delta, so the
+     *     watermark is never applied to it
+     */
+    private function searchPage(string $model, array $fields, array $domain, FetchCriteria $criteria, string $entity, callable $make, ?callable $prime = null, bool $delta = true): Page
     {
         $limit = $this->pageSize($entity, $criteria);
         $offset = (int)($criteria->cursor ?? 0);
 
-        if ($criteria->since instanceof DateTimeInterface) {
+        if ($delta && $criteria->since instanceof DateTimeInterface) {
             // Odoo stores write_date in UTC without a timezone marker, so the comparison value
             // has to be converted rather than formatted as-is — otherwise a site running in a
             // negative offset silently skips several hours of changes every sync.
@@ -596,6 +667,10 @@ class OdooConnector extends Connector
 
         $rows = $this->searchRead($model, $domain, $fields, $limit, $offset);
         $items = [];
+
+        if ($prime !== null) {
+            $prime($rows);
+        }
 
         foreach ($rows as $row) {
             if (is_array($row)) {
@@ -725,6 +800,83 @@ class OdooConnector extends Connector
         }
 
         return is_numeric($value) ? (int)$value : null;
+    }
+
+    /**
+     * A partner's customer code: its `ref` (Odoo's **Reference**), or its id when it has never
+     * been given one, so the partner stays addressable rather than being skipped.
+     *
+     * This is the only derivation. Customers, credit and invoices all go through it so every
+     * document about one partner lands on the same Erpy account, and {@see findPartnerByCode()}
+     * is its inverse for the order push.
+     */
+    private function partnerCode(array $row): string
+    {
+        return $this->partnerRef($row) ?? (string)($row['id'] ?? '');
+    }
+
+    /** A partner's `ref`, or null — Odoo sends an empty char field as `false`, not ''. */
+    private function partnerRef(array $row): ?string
+    {
+        $ref = $row['ref'] ?? null;
+
+        return is_string($ref) && trim($ref) !== '' ? trim($ref) : null;
+    }
+
+    /** @var array<int,string> partner id => customer code */
+    private array $partnerCodes = [];
+
+    /**
+     * Looks up the codes of the partners a page of documents refers to, in one read.
+     *
+     * @param array<int|null> $ids
+     */
+    private function primePartnerCodes(array $ids): void
+    {
+        $missing = array_values(array_unique(array_filter(
+            $ids,
+            fn($id) => $id !== null && !isset($this->partnerCodes[$id]),
+        )));
+
+        if ($missing === []) {
+            return;
+        }
+
+        // `active in (true, false)`: an invoice for a partner that has since been archived still
+        // belongs to that partner's account, and Odoo hides archived records by default.
+        $rows = $this->searchRead('res.partner', [
+            ['id', 'in', $missing],
+            ['active', 'in', [true, false]],
+        ], ['id', 'ref'], count($missing));
+
+        foreach ($rows as $row) {
+            if (is_array($row) && isset($row['id'])) {
+                $this->partnerCodes[(int)$row['id']] = $this->partnerCode($row);
+            }
+        }
+
+        // A partner the integration user cannot read still has an id, which is its code when it
+        // has no reference — better than dropping the invoice's customer altogether, and cached
+        // so it is not asked for again on every row.
+        foreach ($missing as $id) {
+            $this->partnerCodes[$id] ??= (string)$id;
+        }
+    }
+
+    /** The customer code for a partner relation, `[id, "Name"]`. */
+    private function partnerCodeFor(mixed $relation): ?string
+    {
+        $id = $this->relationId($relation);
+
+        if ($id === null) {
+            return null;
+        }
+
+        if (!isset($this->partnerCodes[$id])) {
+            $this->primePartnerCodes([$id]);
+        }
+
+        return $this->partnerCodes[$id] ?? (string)$id;
     }
 
     /**
